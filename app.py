@@ -131,8 +131,7 @@ Model MAE: {MAE:.2f}
 Model RMSE: {RMSE:.2f}
 Model R-squared: {R2:.3f}
 
-Mention that the model uses historical player-season patterns such as points, minutes, games played, usage rate, true shooting percentage, pace, offensive rating, and year-over-year changes. Also mention that injuries, trades, role changes, and breakout seasons can cause uncertainty.
-
+Mention that the model uses historical player-season patterns such as points, minutes, games played, usage rate, true shooting percentage, pace, offensive rating, and year-over-year changes. Also mention that real-world factors such as injuries, trades, role changes, coaching decisions, and breakout seasons can cause uncertainty.
 Do not overstate certainty. Do not give betting advice.
 """
 
