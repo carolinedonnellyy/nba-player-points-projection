@@ -87,7 +87,13 @@ st.sidebar.header("User Input")
 players = sorted(data["PLAYER_NAME"].dropna().unique())
 selected_player = st.sidebar.selectbox("Select a player:", players)
 use_claude = st.sidebar.checkbox("Use Claude-generated explanation", value=True)
-generate_button = st.sidebar.button("Generate Projection")
+if st.sidebar.button("Generate Projection"):
+    st.session_state["projection_generated"] = True
+    st.session_state["projection_player"] = selected_player
+
+# If the user picks a different player from the dropdown, hide the old projection
+if st.session_state.get("projection_player") != selected_player:
+    st.session_state["projection_generated"] = False
 
 if not features_complete:
     st.sidebar.warning(
@@ -501,7 +507,7 @@ def render_news_adjustment(row):
 # Main output
 # ------------------------------------------------------------
 
-if generate_button:
+if st.session_state.get("projection_generated", False):
     matches = data.index[data["PLAYER_NAME"] == selected_player]
     player_idx = int(matches[0])
     player_row = data.iloc[player_idx]
