@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -21,7 +22,8 @@ st.set_page_config(
 st.title("🏀 NBA Player Points Projection Tool")
 st.write(
     "This tool predicts a player's next-season total points using historical NBA performance data, "
-    "advanced statistics, and team context."
+    "advanced statistics, and team context — and then lets you fold in real-world context "
+    "(injuries, trades, role changes) that the stats-only model can't see."
 )
 
 # ------------------------------------------------------------
@@ -38,7 +40,6 @@ R2 = 0.671
 
 @st.cache_data
 def load_data():
-    # Use the richer projection output that includes feature columns.
     return pd.read_csv("final_nba_projection_output.csv")
 
 
@@ -52,18 +53,14 @@ def load_model_and_explainer():
 
 @st.cache_data
 def compute_empirical_band(_data):
-    """
-    80% prediction interval derived from the empirical distribution of
-    residuals (actual - predicted) on the test set. This replaces the
-    previous +/- MAE band, which only covered ~60% of actual values.
-    """
+    """80% prediction interval from the empirical residual distribution."""
     errors = _data["ERROR"].dropna()
     return float(errors.quantile(0.10)), float(errors.quantile(0.90))
 
 
 @st.cache_resource
 def build_nn_index(_data, _feature_names):
-    """Standardized k-NN index for finding similar historical player-seasons."""
+    """Standardized k-NN index for similar historical player-seasons."""
     available = [f for f in _feature_names if f in _data.columns]
     if len(available) < 5:
         return None, None, []
@@ -78,7 +75,6 @@ model, feature_names, explainer = load_model_and_explainer()
 band_lower, band_upper = compute_empirical_band(data)
 nn_index, nn_scaler, nn_features = build_nn_index(data, feature_names)
 
-# Track which model features are present in the CSV for graceful degradation.
 missing_features = [f for f in feature_names if f not in data.columns]
 features_complete = len(missing_features) == 0
 
@@ -89,47 +85,42 @@ features_complete = len(missing_features) == 0
 st.sidebar.header("User Input")
 
 players = sorted(data["PLAYER_NAME"].dropna().unique())
-
-selected_player = st.sidebar.selectbox(
-    "Select a player:",
-    players
-)
-
-use_claude = st.sidebar.checkbox(
-    "Use Claude-generated explanation",
-    value=True
-)
-
+selected_player = st.sidebar.selectbox("Select a player:", players)
+use_claude = st.sidebar.checkbox("Use Claude-generated explanation", value=True)
 generate_button = st.sidebar.button("Generate Projection")
 
 if not features_complete:
     st.sidebar.warning(
-        f"{len(missing_features)} model features are missing from the CSV. "
-        "SHAP and similar-player comps run on whichever features are present, "
-        "but for full fidelity re-export `final_nba_projection_output.csv` "
-        "from your training notebook with the complete feature matrix."
+        f"{len(missing_features)} model features missing from CSV. "
+        "SHAP and similar-player comps will be limited until you re-export "
+        "`final_nba_projection_output.csv` with the full feature matrix."
     )
 
 # ------------------------------------------------------------
-# Helper functions
+# Anthropic client helper
 # ------------------------------------------------------------
 
-def get_confidence_range(row):
-    """80% empirical prediction interval (asymmetric, calibrated to past errors)."""
-    predicted = row["PREDICTED_NEXT_SEASON_PTS"]
+def get_anthropic_client():
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+    if not api_key:
+        return None
+    return Anthropic(api_key=api_key)
+
+
+# ------------------------------------------------------------
+# Confidence range, context, and SHAP helpers
+# ------------------------------------------------------------
+
+def get_confidence_range(predicted):
+    """80% empirical prediction interval centered on a given prediction."""
     return predicted + band_lower, predicted + band_upper
 
 
 def build_context_lines(row):
-    """Pull contextual stats and YoY changes from the row, when available."""
     snap_cols = [
-        ("AGE", "Age"),
-        ("GP", "Games played"),
-        ("MIN", "Minutes played"),
-        ("USG_PCT", "Usage rate"),
-        ("TS_PCT", "True shooting %"),
-        ("TEAM_PACE", "Team pace"),
-        ("TEAM_OFF_RATING", "Team offensive rating"),
+        ("AGE", "Age"), ("GP", "Games played"), ("MIN", "Minutes played"),
+        ("USG_PCT", "Usage rate"), ("TS_PCT", "True shooting %"),
+        ("TEAM_PACE", "Team pace"), ("TEAM_OFF_RATING", "Team offensive rating"),
     ]
     delta_cols = [
         ("PTS_CHANGE", "Year-over-year points change"),
@@ -149,7 +140,6 @@ def build_context_lines(row):
 
 
 def top_shap_drivers(row, k=3):
-    """Return the top-k absolute SHAP contributions as text bullets for the Claude prompt."""
     if not features_complete:
         return ""
     X_player = pd.DataFrame([row[feature_names].astype(float).values], columns=feature_names)
@@ -164,34 +154,154 @@ def top_shap_drivers(row, k=3):
     return "\n".join(bullets)
 
 
-def generate_template_explanation(row):
+# ------------------------------------------------------------
+# AI COMPONENT: News-aware projection adjustment
+# ------------------------------------------------------------
+
+def extract_news_signal(news_text: str, player_name: str) -> dict:
+    """
+    Use Claude as a structured-extraction layer over noisy free-text input.
+    Returns a dict with quantitative adjustment signals or has_relevant_info=False.
+
+    Handles real-world messiness:
+      - Empty / whitespace-only input
+      - Excessively long input (truncated)
+      - Off-topic input or news about a different player (caught by the prompt)
+      - Malformed JSON output (caught and reported)
+      - Missing API key (clean fallback)
+      - Out-of-range numeric values (clamped downstream)
+    """
+    if not news_text or not news_text.strip():
+        return {"has_relevant_info": False, "reason": "No input provided."}
+
+    news_text = news_text.strip()[:5000]
+
+    client = get_anthropic_client()
+    if client is None:
+        return {"has_relevant_info": False, "reason": "ANTHROPIC_API_KEY not configured."}
+
+    prompt = f"""You are an NBA analyst extracting structured signals from a free-text news/report blob about a specific player.
+
+Target player: {player_name}
+
+Input text:
+\"\"\"
+{news_text}
+\"\"\"
+
+Extract any FORWARD-LOOKING information about this player that would change a points projection for next season. Examples of relevant info: injuries that will cause missed games, surgeries with recovery timelines, trades, role changes (starter to bench or vice versa), team tanking, contract holdouts, retirement.
+
+Output ONLY a single JSON object with this exact schema (no preamble, no markdown fences, no comments):
+{{
+  "has_relevant_info": <true|false>,
+  "expected_games_missed": <integer 0-82, conservative>,
+  "minutes_per_game_change_pct": <number, e.g. -10 for 10% fewer mpg, +5 for 5% more>,
+  "usage_role_change_pct": <number, e.g. +15 for a much bigger scoring role>,
+  "severity": "<low|medium|high>",
+  "extraction_confidence": <0.0 to 1.0>,
+  "reasoning": "<one or two sentences>"
+}}
+
+Rules:
+- If the text has no forward-looking, prediction-relevant info about THIS player, set has_relevant_info=false and all numeric fields to 0.
+- If the text is about a different player, set has_relevant_info=false.
+- Be conservative on games missed — only count games for which there is direct evidence in the text.
+- Do not invent information that is not in the text.
+- Output STRICT JSON only.
+"""
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip("` \n")
+        signal = json.loads(raw)
+        if "has_relevant_info" not in signal:
+            return {"has_relevant_info": False, "reason": "Model output missing required fields."}
+        return signal
+    except json.JSONDecodeError:
+        return {"has_relevant_info": False, "reason": "Model returned non-JSON output."}
+    except Exception as e:
+        return {"has_relevant_info": False, "reason": f"API error: {e}"}
+
+
+def apply_adjustment(baseline_pts: float, signal: dict) -> dict:
+    """
+    Convert structured signal into a multiplicative adjustment of the baseline
+    XGBoost prediction. Three independent factors:
+      availability  = (82 - games_missed) / 82       (range [0, 1])
+      minutes       = 1 + minutes_per_game_change_pct/100  (clamped 0.5-1.5)
+      role          = 1 + usage_role_change_pct/100        (clamped 0.5-1.5)
+    Final adjusted = baseline * availability * minutes * role
+    """
+    if not signal.get("has_relevant_info"):
+        return {"applied": False, "baseline": baseline_pts, "adjusted": baseline_pts}
+
+    games_missed = int(np.clip(signal.get("expected_games_missed", 0) or 0, 0, 82))
+    mpg_pct = float(signal.get("minutes_per_game_change_pct", 0) or 0)
+    role_pct = float(signal.get("usage_role_change_pct", 0) or 0)
+
+    availability = (82 - games_missed) / 82
+    minutes_factor = float(np.clip(1 + mpg_pct / 100, 0.5, 1.5))
+    role_factor = float(np.clip(1 + role_pct / 100, 0.5, 1.5))
+
+    adjusted = max(0.0, baseline_pts * availability * minutes_factor * role_factor)
+
+    return {
+        "applied": True,
+        "baseline": float(baseline_pts),
+        "adjusted": float(adjusted),
+        "factors": {
+            "availability": availability,
+            "minutes": minutes_factor,
+            "role": role_factor,
+        },
+        "components": {
+            "games_missed": games_missed,
+            "mpg_change_pct": mpg_pct,
+            "role_change_pct": role_pct,
+        },
+        "severity": signal.get("severity", "low"),
+        "confidence": float(signal.get("extraction_confidence", 0) or 0),
+        "reasoning": signal.get("reasoning", ""),
+    }
+
+
+# ------------------------------------------------------------
+# Narrative explanations
+# ------------------------------------------------------------
+
+def generate_template_explanation(row, predicted_pts=None):
     player_name = row["PLAYER_NAME"]
     current_pts = row["PTS"]
-    predicted_pts = row["PREDICTED_NEXT_SEASON_PTS"]
-    lower, upper = get_confidence_range(row)
+    if predicted_pts is None:
+        predicted_pts = row["PREDICTED_NEXT_SEASON_PTS"]
+    lower, upper = get_confidence_range(predicted_pts)
 
     if predicted_pts > current_pts:
         direction = "increase"
-        interpretation = "The model expects the player's scoring output to rise compared with the previous season."
     elif predicted_pts < current_pts:
         direction = "decrease"
-        interpretation = "The model expects the player's scoring output to decline compared with the previous season."
     else:
         direction = "remain about the same"
-        interpretation = "The model expects the player's scoring output to remain relatively stable."
 
-    summary = f"""
+    return f"""
 {player_name} scored **{current_pts:,.0f} points** in the 2023-24 season. 
-The model projects that he will score about **{predicted_pts:,.0f} points** the following season, 
+The model projects about **{predicted_pts:,.0f} points** the following season, 
 with an estimated 80% range of **{lower:,.0f} to {upper:,.0f} points**.
 
-This suggests that his scoring is expected to **{direction}**. {interpretation}
-
-The projection is based on patterns from historical NBA player seasons, including prior scoring volume, 
-games played, minutes, usage rate, shooting efficiency, pace, offensive rating, and year-over-year role changes. 
-Factors such as injuries, trades, coaching changes, and breakout seasons may cause real results to differ from the model.
+Scoring is expected to **{direction}**. The projection is based on patterns from historical
+NBA player seasons (scoring volume, games played, minutes, usage rate, shooting efficiency,
+pace, offensive rating, and year-over-year role changes).
 """
-    return summary
 
 
 def generate_claude_explanation(row):
@@ -200,7 +310,7 @@ def generate_claude_explanation(row):
     predicted_pts = row["PREDICTED_NEXT_SEASON_PTS"]
     actual_pts = row["NEXT_SEASON_PTS"]
     abs_error = row["ABS_ERROR"]
-    lower, upper = get_confidence_range(row)
+    lower, upper = get_confidence_range(predicted_pts)
 
     context_lines = build_context_lines(row)
     shap_lines = top_shap_drivers(row, k=3)
@@ -221,26 +331,22 @@ Model MAE: {MAE:.2f}, RMSE: {RMSE:.2f}, R-squared: {R2:.3f}
 Player context:
 {context_lines or "(no extra context available)"}
 
-Top SHAP drivers for this prediction (these are the features that moved the model most):
+Top SHAP drivers for this prediction:
 {shap_lines or "(SHAP unavailable)"}
 
-In paragraph 1, explain the projection and call out the most informative drivers above
-(for example, a notable change in usage rate, minutes, or games played, or a top SHAP feature)
-that justify whether the projection is up, down, or stable relative to last season.
-Be specific about which numbers matter.
+In paragraph 1, explain the projection and call out specific drivers above (a notable change in
+usage rate, minutes, games played, or a top SHAP feature) that justify whether the projection
+is up, down, or stable relative to last season. Be specific about which numbers matter.
 
-In paragraph 2, be honest about uncertainty. Mention that the model uses historical player-season
-patterns (points, minutes, games, usage, true shooting, pace, offensive rating, year-over-year
-changes) and that real-world factors like injuries, trades, role changes, coaching decisions, and
-breakout seasons can move the actual outcome. Do not give betting advice. Do not overstate certainty.
+In paragraph 2, be honest about uncertainty. Mention that the model uses historical patterns and
+that real-world factors like injuries, trades, role changes, and breakout seasons can move the
+actual outcome. Do not give betting advice. Do not overstate certainty.
 """
 
+    client = get_anthropic_client()
+    if client is None:
+        return generate_template_explanation(row)
     try:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
-        if not api_key:
-            return generate_template_explanation(row)
-
-        client = Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=400,
@@ -248,19 +354,20 @@ breakout seasons can move the actual outcome. Do not give betting advice. Do not
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text
-
     except Exception:
         return generate_template_explanation(row)
 
 
+# ------------------------------------------------------------
+# Render helpers
+# ------------------------------------------------------------
+
 def render_shap_explanation(row):
-    """Per-prediction SHAP waterfall plot."""
     if not features_complete:
         preview = ", ".join(missing_features[:8])
         more = f" and {len(missing_features) - 8} more" if len(missing_features) > 8 else ""
         st.info(
-            "SHAP plot unavailable: the CSV is missing model features required for "
-            f"explanation: {preview}{more}.\n\n"
+            f"SHAP plot unavailable: missing model features in CSV ({preview}{more}).\n\n"
             "To enable: re-export `final_nba_projection_output.csv` from your training "
             "notebook with the full feature matrix included."
         )
@@ -268,13 +375,11 @@ def render_shap_explanation(row):
 
     X_player = pd.DataFrame([row[feature_names].astype(float).values], columns=feature_names)
     shap_values = explainer(X_player)
-
     fig, ax = plt.subplots(figsize=(8, 5))
     shap.plots.waterfall(shap_values[0], max_display=10, show=False)
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
-
     st.caption(
         "Each bar shows how much that feature pushed the prediction up (red) or down (blue) "
         "from the model's average prediction. The final value is the projected total points."
@@ -282,7 +387,6 @@ def render_shap_explanation(row):
 
 
 def render_similar_players(row, current_idx):
-    """Top-5 historical player-seasons with the most similar feature profile."""
     if nn_index is None:
         st.info("Similar-player comps unavailable: not enough model features in CSV.")
         return
@@ -290,8 +394,6 @@ def render_similar_players(row, current_idx):
     X_player = row[nn_features].fillna(0).astype(float).values.reshape(1, -1)
     X_scaled = nn_scaler.transform(X_player)
     _, indices = nn_index.kneighbors(X_scaled)
-
-    # Drop the player themselves if they appear in the neighbor set.
     similar_idx = [int(i) for i in indices[0] if int(i) != int(current_idx)][:5]
     if not similar_idx:
         st.info("No comps found.")
@@ -308,10 +410,91 @@ def render_similar_players(row, current_idx):
     })
     st.dataframe(comps, use_container_width=True, hide_index=True)
     st.caption(
-        "These are the historical player-seasons whose feature profile (age, role, efficiency, "
-        "team context, year-over-year trajectory) is closest to the selected player's. "
-        "Useful as a sanity check on the projection."
+        "Historical player-seasons whose feature profile (age, role, efficiency, team context, "
+        "year-over-year trajectory) is closest to the selected player's. Useful as a sanity check."
     )
+
+
+def render_news_adjustment(row):
+    """The headline AI component: structured extraction → ML pipeline adjustment."""
+    st.write(
+        "The XGBoost model is trained on stats alone — it has no awareness of injuries, trades, "
+        "or role changes that haven't happened yet. Paste any recent news, injury report, or "
+        "forward-looking context below. Claude will extract a structured signal "
+        "(games missed, minutes change, usage change) and apply it as a calibrated adjustment "
+        "factor on top of the baseline ML prediction."
+    )
+
+    news_text = st.text_area(
+        f"Forward-looking context about {row['PLAYER_NAME']} (optional):",
+        value="",
+        height=130,
+        key=f"news_input_{row['PLAYER_NAME']}",
+        placeholder=(
+            "Example: 'Joel Embiid underwent meniscus surgery in February and the team has "
+            "indicated he is expected to miss the first two months of the 2024-25 season as part "
+            "of a load-management plan.'"
+        ),
+    )
+
+    if st.button("Adjust Projection with Context", key="adjust_btn"):
+        if not news_text.strip():
+            st.warning("Paste some context first, or skip this section.")
+            return
+
+        with st.spinner("Claude is extracting structured signals from the text..."):
+            signal = extract_news_signal(news_text, row["PLAYER_NAME"])
+
+        if not signal.get("has_relevant_info"):
+            reason = signal.get("reason") or signal.get("reasoning") or "No actionable signal."
+            st.info(f"No actionable forward-looking signal extracted. _{reason}_")
+            return
+
+        baseline = float(row["PREDICTED_NEXT_SEASON_PTS"])
+        adj = apply_adjustment(baseline, signal)
+
+        ac1, ac2, ac3 = st.columns(3)
+        with ac1:
+            st.metric("Baseline (model only)", f"{adj['baseline']:,.0f}")
+        with ac2:
+            delta = adj["adjusted"] - adj["baseline"]
+            st.metric(
+                "Adjusted (model + context)",
+                f"{adj['adjusted']:,.0f}",
+                delta=f"{delta:+,.0f}",
+            )
+        with ac3:
+            ratio = adj["adjusted"] / adj["baseline"] if adj["baseline"] else 1.0
+            st.metric("Net adjustment", f"{ratio:.2f}×")
+
+        lo_adj, hi_adj = get_confidence_range(adj["adjusted"])
+        st.write(
+            f"**Adjusted 80% range:** {lo_adj:,.0f} to {hi_adj:,.0f} points  \n"
+            f"Extraction confidence: {adj['confidence']:.0%} | Severity: {adj['severity']}"
+        )
+
+        comp = adj["components"]
+        facs = adj["factors"]
+        breakdown = pd.DataFrame({
+            "Adjustment": ["Availability", "Minutes per game", "Usage / role"],
+            "Extracted signal": [
+                f"{comp['games_missed']} games missed",
+                f"{comp['mpg_change_pct']:+.0f}% mpg",
+                f"{comp['role_change_pct']:+.0f}% usage",
+            ],
+            "Multiplier": [
+                f"{facs['availability']:.2f}×",
+                f"{facs['minutes']:.2f}×",
+                f"{facs['role']:.2f}×",
+            ],
+        })
+        st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+        with st.expander("Claude's reasoning"):
+            st.write(adj["reasoning"] or "(no reasoning returned)")
+
+        with st.expander("Raw extracted signal (debug)"):
+            st.json(signal)
 
 
 # ------------------------------------------------------------
@@ -335,13 +518,12 @@ if generate_button:
 
     st.divider()
 
-    lower, upper = get_confidence_range(player_row)
+    lower, upper = get_confidence_range(player_row["PREDICTED_NEXT_SEASON_PTS"])
     st.write("### 80% Prediction Range")
     st.write(
         f"The model estimates a likely range of **{lower:,.0f} to {upper:,.0f} points**. "
-        "This is an 80% interval derived from the empirical distribution of model errors "
-        "on the test set (calibrated, not assumed). About 80% of historical predictions fell "
-        "within a band of this width."
+        "This is an 80% interval derived from the empirical distribution of model errors on the "
+        "test set — about 80% of historical predictions fell within a band of this width."
     )
 
     st.write("### Model Error on This Case")
@@ -371,6 +553,11 @@ if generate_button:
 
     st.divider()
 
+    st.write("### 🔍 Real-World Context Adjustment")
+    render_news_adjustment(player_row)
+
+    st.divider()
+
     st.write("### Model Evaluation")
     st.write(
         "The model was trained on historical NBA player-season data and tested by using "
@@ -385,8 +572,8 @@ if generate_button:
         st.metric("R²", f"{R2:.3f}")
 
     st.write(
-        f"The mean absolute error means predictions were off by about **{MAE:.0f} points on average**. "
-        f"The R² of **{R2:.3f}** means the model explains about 67.1% of the variation in "
+        f"Predictions were off by about **{MAE:.0f} points on average**. "
+        f"R² of **{R2:.3f}** means the model explains about 67.1% of the variation in "
         "next-season point totals on the test set."
     )
 
